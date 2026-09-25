@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 contador.py — Conteo de personas en video (entradas / salidas / aforo)
+                + PLUS: clasificacion por TAMANO (nino / adulto) y COLOR DE ROPA
 =======================================================================
 
 Lee un video (o webcam/RTSP) y, cuadro a cuadro:
@@ -14,10 +15,20 @@ Lee un video (o webcam/RTSP) y, cuadro a cuadro:
      suma ENTRADA, en el otro SALIDA. El aforo es entradas - salidas.
   4. Registra en CSV cada cruce y una serie temporal de ocupacion.
 
-Por que se cuenta por CRUCE DE LINEA y no "cuantas cajas hay": contar cajas por
-cuadro da un numero que tiembla (una persona tapada por otra desaparece y
-"vuelve a entrar"). El cruce de linea con ID persistente cuenta cada persona
-UNA vez, que es lo que de verdad te sirve para aforo.
+  [NUEVO] 5. CLASIFICA a cada persona:
+       - TAMANO: compara su altura con la de un ADULTO parado en ese mismo
+                 punto del piso (corrige la perspectiva: lo lejano se ve chico).
+                 Si mide menos de --umbral-nino (0.70) de un adulto -> NINO.
+       - ROPA:   recorta la zona del torso, la pasa a HSV y decide el color
+                 predominante (negro, blanco, gris, rojo, azul, verde...).
+     Cada persona se clasifica con TODAS sus muestras (mediana de altura y
+     "votacion" de color cuadro a cuadro), no con un solo cuadro: asi un
+     cuadro malo no cambia el resultado.
+     Se cuenta de dos maneras:
+       - "cruce":  personas que cruzaron la linea (lo mas confiable)
+       - "vistos": todas las personas rastreadas al menos --min-muestras cuadros
+
+Todas las partes nuevas estan marcadas con  # [NUEVO]
 
 Instalacion:
     pip install opencv-python numpy
@@ -26,6 +37,7 @@ Instalacion:
 Uso:
     python contador.py entrada.mp4 --linea              # dibujar la linea con el mouse
     python contador.py entrada.mp4 --motor yolo
+    python contador.py entrada.mp4 --umbral-nino 0.40 --umbral-negro 0.35
     python contador.py entrada.mp4 --headless --record salida.mp4
     python contador.py 0                                 # webcam
 
@@ -41,7 +53,7 @@ import json                          # lee/guarda la linea de conteo en linea.js
 import os                            # revisa si existen archivos
 import sys                           # sys.exit() para terminar con un mensaje de error
 import time                          # reloj real, para reproducir a velocidad real
-from collections import deque        # lista con tamano maximo: al llenarse descarta lo mas viejo
+from collections import Counter, deque   # [NUEVO] Counter = diccionario que cuenta cosas
 from datetime import datetime, timedelta   # fechas y formato h:mm:ss
 
 import cv2                           # OpenCV: leer video, dibujar, mostrar ventanas
@@ -59,6 +71,7 @@ RED = (60, 60, 255)
 WHITE = (245, 245, 245)
 GREY = (150, 150, 150)
 DARK = (35, 28, 20)
+MAGENTA = (200, 80, 255)             # [NUEVO] color del panel de perfil
 # Colores que se reparten entre las personas para distinguirlas en pantalla
 COLORES = [(230, 220, 60), (120, 220, 0), (0, 190, 255), (200, 120, 255),
            (255, 180, 90), (120, 255, 220), (180, 180, 255), (90, 230, 160)]
@@ -220,6 +233,10 @@ class Persona:
         self.rastro.append(self.centro)
         self.contada = False          # ya cruzo la linea una vez
         self.color = COLORES[self.id % len(COLORES)]
+        # [NUEVO] Memoria para clasificarla:
+        self.alturas: deque = deque(maxlen=90)  # (y_pies, altura) en cada cuadro limpio
+        self.votos_color: Counter = Counter()   # {"negro": 12, "azul": 3, ...}
+        self.muestras = 0                       # en cuantos cuadros la observamos
 
     @property
     def centro(self):
@@ -278,6 +295,203 @@ class Rastreador:
 
 
 # --------------------------------------------------------------------------- #
+# [NUEVO] 2b. Clasificacion: tamano y color de ropa
+# --------------------------------------------------------------------------- #
+# Rangos de TONO (Hue) en OpenCV. OJO: en OpenCV el tono va de 0 a 179
+# (no de 0 a 360), asi que cada valor es "grados / 2".
+RANGOS_TONO = [
+    ("rojo", 0, 10), ("naranja", 10, 22), ("amarillo", 22, 35),
+    ("verde", 35, 85), ("azul", 85, 130), ("morado", 130, 160),
+    ("rojo", 160, 180),                 # el rojo "da la vuelta" al final del circulo
+]
+V_NEGRO = 60      # brillo (V) por debajo de esto = pixel negro/muy oscuro (0..255)
+V_BLANCO = 190    # brillo por encima de esto y poca saturacion = blanco
+S_GRIS = 50       # saturacion por debajo de esto = sin color (gris)
+
+
+def color_ropa(frame, caja, umbral_negro=0.40):
+    """Devuelve el nombre del color predominante del TORSO de la persona.
+
+    Como funciona:
+      1. Recorta el torso: del 20 % al 55 % del alto de la caja y la franja
+         central (25 % a 75 % del ancho), para no agarrar fondo ni cabeza.
+      2. Pasa el recorte a HSV: H = tono (que color), S = saturacion (que tan
+         vivo), V = brillo. En HSV es mucho mas facil separar colores que en BGR.
+      3. Clasifica cada pixel: negro (V bajo), blanco (V alto y S baja),
+         gris (S baja) o un color segun su tono H.
+      4. Si al menos 'umbral_negro' de los pixeles son negros -> "negro".
+         Si no, gana el color con mas pixeles.
+    """
+    x, y, w, h = caja
+    H, W = frame.shape[:2]
+    x1, x2 = max(int(x + w * 0.25), 0), min(int(x + w * 0.75), W)
+    y1, y2 = max(int(y + h * 0.20), 0), min(int(y + h * 0.55), H)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None                     # recorte muy chico: no se puede opinar
+    hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
+    tono, sat, brillo = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+
+    # Mascaras booleanas: True en los pixeles que cumplen la condicion
+    negro = brillo < V_NEGRO
+    blanco = (brillo > V_BLANCO) & (sat < S_GRIS) & ~negro
+    gris = (sat < S_GRIS) & ~negro & ~blanco
+    con_color = ~(negro | blanco | gris)
+
+    total = tono.size
+    if negro.sum() / total >= umbral_negro:
+        return "negro"
+
+    conteo = Counter({"blanco": int(blanco.sum()), "gris": int(gris.sum())})
+    tonos = tono[con_color]
+    for nombre, a, b in RANGOS_TONO:
+        conteo[nombre] += int(((tonos >= a) & (tonos < b)).sum())
+    conteo["negro"] = int(negro.sum())  # por si igual es el mayor
+    return conteo.most_common(1)[0][0]
+
+
+class Clasificador:
+    """Junta las observaciones de cada persona y lleva los contadores del perfil.
+
+    TAMANO CON PERSPECTIVA:
+      Una persona lejos de la camara se ve mas chica y aparece mas ARRIBA en
+      la imagen (sus pies estan mas arriba). Por eso no sirve comparar alturas
+      "en bruto". En su lugar:
+        1. Guardamos de TODAS las personas el par (posicion de los pies, altura).
+        2. Ajustamos una recta:  altura_adulto = a * y_pies + b
+           usando el percentil 75 (la gente alta, o sea adultos) en cada franja.
+        3. Para cada persona calculamos  razon = su altura / altura_adulto
+           esperada en ESE punto del piso.  ~1.0 = adulto, < umbral = NINO.
+    """
+
+    def __init__(self, umbral_nino=0.70, umbral_negro=0.40, min_muestras=15):
+        # umbral_nino: razon altura / altura de adulto en ese lugar.
+        #              0.70 = mide menos del 70 % de un adulto -> NINO.
+        # umbral_negro: fraccion del torso que debe ser oscura para decir "negro".
+        # min_muestras: cuadros minimos para contar a alguien en "vistos"
+        #               (filtra detecciones fantasma y IDs que se cortan).
+        self.umbral_nino = umbral_nino
+        self.umbral_negro = umbral_negro
+        self.min_muestras = min_muestras
+        self.escena: deque = deque(maxlen=6000)   # (y_pies, altura) de todos
+        self.modelo = None                          # (a, b) de la recta
+        self.rango = (0.0, 1.0)                     # zona del piso con datos
+        self._nuevas = 0
+        self.reiniciar()
+
+    def reiniciar(self):
+        self.cruce_tam = Counter()      # {"NINO": 3, "ADULTO": 5} de quienes cruzaron
+        self.cruce_color = Counter()    # {"negro": 2, "azul": 4, ...}
+        self.visto_tam = Counter()      # igual, pero de todas las personas rastreadas
+        self.visto_color = Counter()
+        self.registro: list[tuple] = []  # una fila por persona vista (para el CSV)
+
+    @staticmethod
+    def _tapada(caja, otras, max_solape=0.25):
+        """True si otra caja tapa mas del 25 % de esta (su altura no es confiable)."""
+        x, y, w, h = caja
+        area = max(w * h, 1)
+        for o in otras:
+            if tuple(o) == tuple(caja):
+                continue
+            ox, oy, ow, oh = o
+            iw = max(0, min(x + w, ox + ow) - max(x, ox))
+            ih = max(0, min(y + h, oy + oh) - max(y, oy))
+            if iw * ih / area > max_solape:
+                return True
+        return False
+
+    def observar(self, p, frame, cajas):
+        """Se llama en cada cuadro para cada persona visible."""
+        x, y, w, h = p.caja
+        H = frame.shape[0]
+        p.muestras += 1
+        # La altura solo se usa si la medida es "limpia":
+        #  - la caja no toca el borde de arriba/abajo (persona cortada)
+        #  - no es muy ancha (w/h > 0.6 = sentada, agachada o 2 personas juntas)
+        #  - nadie la tapa
+        limpia = (y > 2 and y + h < H - 2 and w / max(h, 1) <= 0.6
+                  and not self._tapada(p.caja, cajas))
+        if limpia:
+            muestra = ((y + h) / H, h / H)      # (y de los pies, altura) en 0..1
+            p.alturas.append(muestra)
+            self.escena.append(muestra)
+            self._nuevas += 1
+            if self._nuevas >= 50:              # recalculamos la recta cada 50 muestras
+                self._nuevas = 0
+                self._ajustar()
+        c = color_ropa(frame, p.caja, self.umbral_negro)
+        if c:
+            p.votos_color[c] += 1       # cada cuadro "vota" por un color
+
+    def _ajustar(self):
+        """Ajusta la recta  altura_adulto = a * y_pies + b."""
+        if len(self.escena) < 150:
+            return                      # aun muy pocos datos
+        arr = np.array(self.escena)
+        # Partimos la escena en 8 franjas horizontales con la misma cantidad de datos
+        cortes = np.quantile(arr[:, 0], np.linspace(0, 1, 9))
+        xs, ys = [], []
+        for lo, hi in zip(cortes[:-1], cortes[1:]):
+            sel = arr[(arr[:, 0] >= lo) & (arr[:, 0] <= hi)]
+            if len(sel) >= 10:
+                xs.append(float(np.median(sel[:, 0])))
+                ys.append(float(np.percentile(sel[:, 1], 75)))  # "adulto tipico" de la franja
+        if len(xs) >= 3:
+            a, b = np.polyfit(xs, ys, 1)            # recta que mejor pasa por esos puntos
+            self.modelo = (float(a), float(b))
+            # Zona del piso donde SI hay datos: fuera de ella la recta no es confiable
+            self.rango = (min(xs), max(xs))
+
+    def _esperada(self, y_pies):
+        if self.modelo is None:
+            return None
+        a, b = self.modelo
+        lo, _ = self.rango
+        # Solo limitamos hacia el FONDO (lejos), donde la recta se va a cero y
+        # la razon se dispara. Hacia ADELANTE (cerca de la camara) la perspectiva
+        # sigue siendo lineal, asi que la recta se puede extender sin problema.
+        y_pies = max(y_pies, lo)
+        return max(a * y_pies + b, 0.05)
+
+    def altura_rel(self, p):
+        """Razon altura / adulto esperado (mediana de todas sus muestras)."""
+        if not p.alturas or self.modelo is None:
+            return 0.0
+        razones = [h / self._esperada(yp) for yp, h in p.alturas]
+        return float(np.median(razones))
+
+    def tamano(self, p):
+        if len(p.alturas) < 3 or self.modelo is None:
+            return "?"                  # aun no tenemos datos suficientes
+        return "NINO" if self.altura_rel(p) < self.umbral_nino else "ADULTO"
+
+    def color(self, p):
+        return p.votos_color.most_common(1)[0][0] if p.votos_color else "?"
+
+    def registrar_cruce(self, p):
+        # Al momento de cruzar puede que aun no haya datos ("?").
+        # Esto es solo PROVISIONAL (para el aviso en pantalla y conteo.csv):
+        # el conteo definitivo del perfil se hace cuando la persona se va,
+        # con todas sus muestras (ver registrar_visto).
+        return self.tamano(p), self.color(p)
+
+    def registrar_visto(self, p):
+        """Se llama cuando la persona desaparece (o al final del video)."""
+        tam, col = self.tamano(p), self.color(p)
+        if p.contada:                   # cruzo la linea: va al perfil de "cruce"
+            self.cruce_tam[tam] += 1
+            self.cruce_color[col] += 1
+        if p.muestras < self.min_muestras:
+            return None                 # muy poco tiempo en pantalla: probable fantasma
+        self.visto_tam[tam] += 1
+        self.visto_color[col] += 1
+        fila = (p.id, round(self.altura_rel(p), 3), tam, col, p.muestras,
+                round(p.t_inicio, 2), round(p.t_visto, 2), p.contada)
+        self.registro.append(fila)
+        return fila
+
+
+# --------------------------------------------------------------------------- #
 # 3. Linea de conteo
 # --------------------------------------------------------------------------- #
 class LineaConteo:
@@ -290,7 +504,7 @@ class LineaConteo:
         self.invertir = invertir        # True = intercambia que sentido es entrada y cual salida
         self.entradas = 0
         self.salidas = 0
-        self.eventos: list[tuple[float, str, int]] = []   # (segundo, tipo, id de persona)
+        self.eventos: list[tuple] = []   # (segundo, tipo, id, tamano, color)
 
     def lado(self, punto):
         """Signo del producto cruz: de que lado de la linea cae el punto."""
@@ -325,7 +539,6 @@ class LineaConteo:
         else:
             self.salidas += 1
         tipo = "ENTRADA" if entra else "SALIDA"
-        self.eventos.append((t, tipo, persona.id))
         return tipo
 
     def _cerca(self, punto, margen=1.35):
@@ -412,7 +625,7 @@ def panel(img, x, y, w, h, titulo, filas, accent=CYAN):
                     0.58, WHITE, 1, cv2.LINE_AA)
 
 
-def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
+def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max, clasif):
     # Devuelve una COPIA del cuadro con todo dibujado encima (no modifica el original)
     out = frame.copy()
     H, W = out.shape[:2]
@@ -443,9 +656,17 @@ def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
             # polylines necesita los puntos con forma (N, 1, 2) y tipo int32
             pts = np.array(p.rastro, np.int32).reshape(-1, 1, 2)
             cv2.polylines(out, [pts], False, p.color, 2, cv2.LINE_AA)
-        etq = f"#{p.id}" + (" OK" if p.contada else "")   # "OK" = ya fue contada
+        # [NUEVO] Etiqueta: "#3 NINO negro .31 OK"
+        #   0.62 = su altura / la de un adulto en ese lugar (1.0 = adulto tipico)
+        #   OK  = ya fue contada al cruzar la linea
+        etq = (f"#{p.id} {clasif.tamano(p)} {clasif.color(p)} "
+               f"{clasif.altura_rel(p):.2f}"
+               + (" OK" if p.contada else ""))
         cv2.putText(out, etq, (x, max(y - 8, 14)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, p.color, 2, cv2.LINE_AA)
+        # [NUEVO] Marco del torso que se usa para leer el color de la ropa
+        cv2.rectangle(out, (int(x + w * 0.25), int(y + h * 0.20)),
+                      (int(x + w * 0.75), int(y + h * 0.55)), WHITE, 1)
 
     # Panel principal con los contadores
     e = linea.entradas if linea else 0
@@ -458,10 +679,21 @@ def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
     ], accent=GREEN if a <= aforo_max else RED)   # rojo si se supera el aforo
 
     # Panel de la esquina derecha: personas visibles y tiempo del video
-    panel(out, W - 210, 14, 196, 100, "SESION", [
+    panel(out, W - 254, 14, 240, 100, "SESION", [
         f"Visibles: {len(personas)}",
         f"T: {timedelta(seconds=int(t_video))}",
     ], accent=CYAN)
+
+    # [NUEVO] Panel de perfil: "cruce / vistos"
+    ct, vt = clasif.cruce_tam, clasif.visto_tam
+    cc, vc = clasif.cruce_color, clasif.visto_color
+    top = cc.most_common(1) or vc.most_common(1)
+    panel(out, W - 254, 124, 240, 150, "PERFIL  (cruce / vistos)", [
+        f"Ninos     : {ct['NINO']} / {vt['NINO']}",
+        f"Adultos   : {ct['ADULTO']} / {vt['ADULTO']}",
+        f"Ropa negra: {cc['negro']} / {vc['negro']}",
+        f"Color top : {top[0][0] if top else '-'}",
+    ], accent=MAGENTA)
 
     # curva de ocupacion
     if len(serie) > 2:
@@ -469,12 +701,12 @@ def dibujar(frame, personas, linea, t_video, progress, serie, aforo_max):
         cv2.rectangle(out, (x0, y0), (x0 + wg, y0 + hg), (90, 90, 90), 1)
         # Tomamos los ultimos valores (uno por pixel de ancho del grafico)
         vals = np.array([v for _, v in serie][-wg:], dtype=np.float32)
-        top = max(float(vals.max()), 1.0)              # valor maximo = parte de arriba del grafico
+        top_v = max(float(vals.max()), 1.0)            # valor maximo = parte de arriba del grafico
         # Convertimos cada valor a coordenadas de pixel (y crece hacia abajo en imagenes)
         xs = np.linspace(x0, x0 + wg, len(vals)).astype(np.int32)
-        ys = (y0 + hg - vals / top * (hg - 4)).astype(np.int32)
+        ys = (y0 + hg - vals / top_v * (hg - 4)).astype(np.int32)
         cv2.polylines(out, [np.stack([xs, ys], 1)], False, CYAN, 1, cv2.LINE_AA)
-        cv2.putText(out, f"ocupacion (max {int(top)})", (x0 + 4, y0 - 5),
+        cv2.putText(out, f"ocupacion (max {int(top_v)})", (x0 + 4, y0 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, GREY, 1, cv2.LINE_AA)
 
     # Alerta visual: marco rojo si hay mas gente que el aforo permitido
@@ -512,6 +744,15 @@ def main() -> None:
     ap.add_argument("--end", type=float, default=None)
     ap.add_argument("--stride", type=int, default=1, help="procesa 1 de cada N cuadros")
     ap.add_argument("--speed", type=float, default=0.0, help="0 = a tope, 1 = tiempo real")
+    # [NUEVO] opciones del perfil
+    ap.add_argument("--umbral-nino", type=float, default=0.70,
+                    help="altura / altura de adulto en ese punto; menos = NINO")
+    ap.add_argument("--umbral-negro", type=float, default=0.40,
+                    help="fraccion del torso oscura para decir ropa negra")
+    ap.add_argument("--min-muestras", type=int, default=15,
+                    help="cuadros minimos para contar a alguien en 'vistos'")
+    ap.add_argument("--personas-csv", default="personas.csv",
+                    help="CSV con una fila por persona vista (tamano, color)")
     args = ap.parse_args()
 
     # ---- Abrir el video ---- #
@@ -552,9 +793,10 @@ def main() -> None:
               "        Corre con --linea para dibujar la tuya.")
     linea = LineaConteo(pts[0], pts[1], invertir=args.invertir)
 
-    # Creamos las tres piezas del sistema: detector, rastreador (y la linea, arriba)
+    # Creamos las piezas del sistema: detector, rastreador, clasificador (y la linea, arriba)
     det = Detector(args.motor, args.modelo, args.proto, args.conf)
     rastreador = Rastreador()
+    clasif = Clasificador(args.umbral_nino, args.umbral_negro, args.min_muestras)  # [NUEVO]
 
     # ---- Grabacion opcional del video con las detecciones (--record) ---- #
     writer = None
@@ -570,12 +812,28 @@ def main() -> None:
     # OJO: se abre en modo "a" (append = agregar al final). Cada ejecucion
     # AGREGA filas al archivo existente; no lo borra. Solo se escribe el
     # encabezado si el archivo es nuevo.
+    # [NUEVO] Ahora tiene 2 columnas mas (tamano, color): si tienes un
+    # conteo.csv de la version anterior, BORRALO antes de correr esta.
     nuevo = not os.path.exists(args.csv)
     csv_f = open(args.csv, "a", newline="", encoding="utf-8")
     csv_w = csv.writer(csv_f)
     if nuevo:
         csv_w.writerow(["t_video_s", "timestamp", "evento", "persona_id",
+                        "tamano", "color_ropa",
                         "entradas", "salidas", "aforo"])
+
+    # [NUEVO] CSV de personas: se sobrescribe ("w") en cada ejecucion
+    pers_f = open(args.personas_csv, "w", newline="", encoding="utf-8")
+    pers_w = csv.writer(pers_f)
+    pers_w.writerow(["persona_id", "altura_rel", "tamano", "color_ropa",
+                     "cuadros", "t_inicio_s", "t_fin_s", "cruzo_linea"])
+
+    def registrar_visto(p):
+        # [NUEVO] Cuenta a la persona en "vistos" y la escribe en personas.csv
+        fila = clasif.registrar_visto(p)
+        if fila:
+            pers_w.writerow(fila)
+            pers_f.flush()
 
     # ---- CSV opcional de ocupacion: una fila por segundo (--serie-csv) ---- #
     serie_f = serie_w = None
@@ -621,20 +879,31 @@ def main() -> None:
                 # PASO 1: detectar personas en este cuadro
                 cajas = det.detectar(frame)
                 # PASO 2: emparejarlas con las personas que ya conociamos
-                rastreador.actualizar(cajas, t_video)
+                salieron = rastreador.actualizar(cajas, t_video)
+                # [NUEVO] quienes ya se fueron de la imagen se cuentan en "vistos"
+                for p in salieron:
+                    registrar_visto(p)
+
+                # [NUEVO] PASO 2b: observar tamano y color de cada persona visible
+                for p in rastreador.visibles():
+                    clasif.observar(p, frame, cajas)
 
                 # PASO 3: revisar si alguien cruzo la linea
                 for p in rastreador.visibles():
                     tipo = linea.revisar(p, t_video)
                     if tipo:
+                        tam, col = clasif.registrar_cruce(p)          # [NUEVO]
+                        linea.eventos.append((t_video, tipo, p.id, tam, col))
                         # PASO 4: registrar el cruce en el CSV
                         csv_w.writerow([round(t_video, 2),
                                         datetime.now().isoformat(timespec="seconds"),
-                                        tipo, p.id, linea.entradas, linea.salidas,
+                                        tipo, p.id, tam, col,
+                                        linea.entradas, linea.salidas,
                                         linea.aforo])
                         csv_f.flush()   # escribir al disco ya, por si el programa se corta
                         print(f"\n  [{timedelta(seconds=int(t_video))}] {tipo}"
-                              f"  persona #{p.id}  ->  aforo={linea.aforo}")
+                              f"  persona #{p.id} ({tam}, ropa {col})"
+                              f"  ->  aforo={linea.aforo}")
 
                 # Guardamos cuantas personas se ven (para el grafico y el CSV de ocupacion)
                 visibles = rastreador.visibles()
@@ -649,7 +918,7 @@ def main() -> None:
                 # PASO 5: dibujar todo sobre el cuadro
                 progress = (t_video / dur) if dur else None    # fraccion del video recorrida (0 a 1)
                 vis = dibujar(frame, visibles, linea, t_video, progress,
-                              serie, args.aforo_max)
+                              serie, args.aforo_max, clasif)
                 if writer:
                     writer.write(vis)                           # agregar el cuadro al video de salida
 
@@ -692,17 +961,22 @@ def main() -> None:
                 if k == ord("r"):               # r = reiniciar contadores
                     linea.entradas = linea.salidas = 0
                     linea.eventos.clear()
+                    clasif.reiniciar()          # [NUEVO]
                     print("Contadores reiniciados.")
     except KeyboardInterrupt:
         # Ctrl+C en la terminal: salimos ordenadamente
         print("\nInterrumpido.")
     finally:
+        # [NUEVO] las personas que siguen en pantalla al terminar tambien cuentan
+        for p in rastreador.personas:
+            registrar_visto(p)
         # "finally" se ejecuta SIEMPRE, aunque haya error: cerramos todo
         # para que el video y los CSV queden bien guardados.
         cap.release()
         if writer:
             writer.release()
         csv_f.close()
+        pers_f.close()
         if serie_f:
             serie_f.close()
         if not args.headless:
@@ -720,11 +994,34 @@ def main() -> None:
     print(f"Salidas            : {linea.salidas}")
     print(f"Aforo final        : {linea.aforo}")
     print(f"Pico simultaneo    : {max(picos)} personas en pantalla")
+
+    # [NUEVO] resumen del perfil
+    print("\nPERFIL                cruzaron   vistos")
+    for etiqueta, clave in (("Ninos", "NINO"), ("Adultos", "ADULTO"),
+                            ("Sin datos (?)", "?")):
+        print(f"  {etiqueta:<18} {clasif.cruce_tam[clave]:>8} {clasif.visto_tam[clave]:>8}")
+    print(f"  {'Ropa negra':<18} {clasif.cruce_color['negro']:>8} "
+          f"{clasif.visto_color['negro']:>8}")
+    if clasif.visto_color:
+        print("\n  Colores de ropa (vistos):")
+        for col, n in clasif.visto_color.most_common():
+            print(f"    {col:<10} {n}")
+    if clasif.registro:
+        # Sirve para calibrar --umbral-nino: mira en que valor se separan
+        alts = sorted(f[1] for f in clasif.registro)
+        print(f"\n  Razon altura/adulto: min {alts[0]:.2f}  "
+              f"max {alts[-1]:.2f}  (umbral nino = {args.umbral_nino})")
+
     if linea.eventos:
-        print("\nCronologia:")
-        for t, tipo, pid in linea.eventos:
-            print(f"   {str(timedelta(seconds=int(t))):>8}  {tipo:<8} persona #{pid}")
+        # Usamos la clasificacion FINAL (con todas las muestras), no la provisional
+        final = {f[0]: (f[2], f[3]) for f in clasif.registro}
+        print("\nCronologia (clasificacion final):")
+        for t, tipo, pid, tam, col in linea.eventos:
+            tam, col = final.get(pid, (tam, col))
+            print(f"   {str(timedelta(seconds=int(t))):>8}  {tipo:<8} "
+                  f"persona #{pid}  {tam:<6} {col}")
     print(f"\nCSV de eventos     : {args.csv}")
+    print(f"CSV de personas    : {args.personas_csv}")
     if args.serie_csv:
         print(f"CSV de ocupacion   : {args.serie_csv}")
     if args.record:

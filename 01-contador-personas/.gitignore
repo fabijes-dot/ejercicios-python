@@ -1,0 +1,11 @@
+# Videos grandes: GitHub rechaza archivos de mas de 100 MB
+ciudad.mp4
+demo_perfil.mp4
+demo_perfil_liviano.mp4
+
+# Archivos temporales de Python
+__pycache__/
+*.pyc
+
+# Capturas de pantalla hechas con la tecla "s"
+captura_*.png
